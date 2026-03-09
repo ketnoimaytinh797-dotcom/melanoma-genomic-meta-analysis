@@ -1,0 +1,1 @@
+Thank you for this important comment. We have now made the original R analysis script and the supporting study-level dataset used for the analyses publicly available in a GitHub repository to improve transparency and reproducibility. The repository link has been added to the revised manuscript in the Code Availability section.
