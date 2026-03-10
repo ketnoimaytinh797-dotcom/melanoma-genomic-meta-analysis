@@ -4,6 +4,7 @@ suppressPackageStartupMessages({
   library(stringr)
   library(purrr)
   library(readr)
+  library(tibble)
   library(meta)
 })
 
@@ -11,6 +12,7 @@ suppressPackageStartupMessages({
 # Configuration
 # -------------------------------------------------------------------
 table_s11_file <- "Table S11 Data from Studies Included in the Meta-analysis.xlsx"
+table_s12_file <- "Table S12 List of Studies and Reasons for Exclusion.xlsx"
 asian_file <- "Asian Melanoma.xlsx"
 results_dir <- "results"
 
@@ -22,7 +24,9 @@ table2_method_order <- c(
   "Pyrosequencing",
   "Target NGS",
   "Sanger",
-  "Sequenom Massarray"
+  "Sequenom Massarray",
+  "WES",
+  "WGS"
 )
 
 dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
@@ -79,8 +83,10 @@ collapse_methodology <- function(x) {
       "direct sequencing",
       "direct sequencing of pcr products"
     ) ~ "Sanger",
-    y %in% c("ngs", "wes", "wgs", "pcr, ngs") ~ "NGS",
-    str_detect(y, "pcr|rtpcr|rt pcr|qrt pcr|prt pcr|castpcr|cast pcr|ms pcr|rna.?seq|snapshot|droplet digital pcr") ~ "PCR",
+    y == "ngs" ~ "NGS",
+    str_detect(y, "\\bwes\\b") ~ "WES",
+    str_detect(y, "\\bwgs\\b") ~ "WGS",
+    str_detect(y, "pcr|rtpcr|rt pcr|qrt pcr|prt pcr|castpcr|cast pcr|ms pcr|snapshot|droplet digital pcr") ~ "PCR",
     TRUE ~ clean_text(x)
   )
 }
@@ -175,7 +181,7 @@ prepare_gene_data <- function(data, gene, tumor = c("primary", "metastatic")) {
   n_column <- if (tumor == "primary") "Sample_primary" else "Metastatic_samples_N"
 
   if (!gene_column %in% names(data)) {
-    stop(sprintf("Column '%s' was not found in the dataset.", gene_column))
+    return(tibble())
   }
 
   data %>%
@@ -210,28 +216,114 @@ fit_prevalence_model <- function(d) {
   )
 }
 
-fit_method_subgroup_model <- function(data, gene) {
-  d <- prepare_gene_data(data, gene = gene, tumor = "primary") %>%
-    filter(!is.na(Method_group)) %>%
-    mutate(Method_group = factor(Method_group, levels = table2_method_order))
+transf_ipft_hm <- function(theta, n_vec) {
+  n_vec <- as.numeric(n_vec)
+  nhm <- length(n_vec) / sum(1 / n_vec)
+  s <- sin(theta)
+  inside <- 1 - (s + (s - 1 / s) / nhm)^2
+  inside[inside < 0] <- 0
+  0.5 * (1 - sign(cos(theta)) * sqrt(inside))
+}
 
-  if (nrow(d) == 0) {
-    return(NULL)
+format_p_het <- function(x) {
+  ifelse(is.na(x), NA_character_, ifelse(x < 0.01, "<0.01", sprintf("%.2f", x)))
+}
+
+summarise_metaprop <- function(model, d, gene, tumor_label) {
+  if (is.null(model) || nrow(d) == 0) {
+    return(tibble())
   }
 
-  metaprop(
-    event = event,
-    n = n,
-    studlab = studylab,
-    subgroup = Method_group,
-    data = d,
-    sm = "PFT",
-    method = "Inverse",
-    method.tau = "DL",
-    common = FALSE,
-    random = TRUE,
-    backtransf = TRUE
+  tibble(
+    Gene = gene,
+    `Tumor type` = tumor_label,
+    Studies = dplyr::n_distinct(d$TT),
+    `Sample size` = sum(d$n, na.rm = TRUE),
+    `Total mutated` = sum(d$event, na.rm = TRUE),
+    `TT IDs` = paste(sort(unique(d$TT)), collapse = ", "),
+    `Pooled prevalence (%)` = round(100 * transf_ipft_hm(model$TE.random, d$n), 1),
+    `95% CI` = sprintf(
+      "%.1f–%.1f",
+      100 * transf_ipft_hm(model$lower.random, d$n),
+      100 * transf_ipft_hm(model$upper.random, d$n)
+    ),
+    `I2 (%)` = ifelse(is.null(model$I2), NA_real_, round(as.numeric(model$I2), 1)),
+    `Heterogeneity P` = format_p_het(model$pval.Q)
   )
+}
+
+build_method_summary <- function(data, genes) {
+  purrr::map_dfr(genes, function(gene) {
+    d_gene <- prepare_gene_data(data, gene = gene, tumor = "primary") %>%
+      filter(!is.na(Method_group))
+
+    if (nrow(d_gene) == 0) {
+      return(tibble())
+    }
+
+    method_levels <- intersect(table2_method_order, unique(d_gene$Method_group))
+
+    purrr::map_dfr(method_levels, function(method_name) {
+      d_sub <- d_gene %>%
+        filter(Method_group == method_name)
+
+      model <- fit_prevalence_model(d_sub)
+
+      if (is.null(model)) {
+        return(tibble())
+      }
+
+      tibble(
+        Gene = gene,
+        Subgroup = method_name,
+        Studies = dplyr::n_distinct(d_sub$TT),
+        `Sample size` = sum(d_sub$n, na.rm = TRUE),
+        `Total mutated` = sum(d_sub$event, na.rm = TRUE),
+        `TT IDs` = paste(sort(unique(d_sub$TT)), collapse = ", "),
+        `Pooled prevalence (%)` = round(100 * transf_ipft_hm(model$TE.random, d_sub$n), 1),
+        `95% CI` = sprintf(
+          "%.1f–%.1f",
+          100 * transf_ipft_hm(model$lower.random, d_sub$n),
+          100 * transf_ipft_hm(model$upper.random, d_sub$n)
+        ),
+        `I2 (%)` = ifelse(is.null(model$I2), NA_real_, round(as.numeric(model$I2), 1)),
+        `Heterogeneity P` = format_p_het(model$pval.Q)
+      )
+    })
+  })
+}
+
+build_asian_summary <- function(data, genes = key_genes) {
+  purrr::map_dfr(genes, function(gene) {
+    d_primary <- prepare_gene_data(data, gene = gene, tumor = "primary")
+    d_metastatic <- prepare_gene_data(data, gene = gene, tumor = "metastatic")
+
+    model_primary <- fit_prevalence_model(d_primary)
+    model_metastatic <- fit_prevalence_model(d_metastatic)
+
+    bind_rows(
+      summarise_metaprop(model_primary, d_primary, gene, "Primary"),
+      summarise_metaprop(model_metastatic, d_metastatic, gene, "Metastatic")
+    )
+  })
+}
+
+build_all_gene_summary <- function(data) {
+  gene_columns <- names(data)[18:155]
+  gene_columns <- gene_columns[gene_columns != "blank"]
+
+  purrr::map_dfr(gene_columns, function(gene) {
+    d_primary <- prepare_gene_data(data, gene = gene, tumor = "primary")
+    d_metastatic <- prepare_gene_data(data, gene = gene, tumor = "metastatic")
+
+    model_primary <- fit_prevalence_model(d_primary)
+    model_metastatic <- fit_prevalence_model(d_metastatic)
+
+    bind_rows(
+      summarise_metaprop(model_primary, d_primary, gene, "Primary"),
+      summarise_metaprop(model_metastatic, d_metastatic, gene, "Metastatic")
+    )
+  })
 }
 
 save_model_summary <- function(model, file_path) {
@@ -244,51 +336,6 @@ save_model_summary <- function(model, file_path) {
   })
 
   writeLines(txt, con = file_path)
-}
-
-build_method_study_map <- function(data, genes) {
-  purrr::map_dfr(genes, function(gene) {
-    prepare_gene_data(data, gene = gene, tumor = "primary") %>%
-      filter(!is.na(Method_group)) %>%
-      mutate(Method_group = factor(Method_group, levels = table2_method_order)) %>%
-      arrange(Method_group, TT) %>%
-      group_by(Method_group) %>%
-      summarise(
-        Gene = gene,
-        Studies = n_distinct(TT),
-        Sample_size = sum(n, na.rm = TRUE),
-        TT_ids = paste(sort(unique(TT)), collapse = ", "),
-        .groups = "drop"
-      ) %>%
-      rename(Subgroup = Method_group) %>%
-      select(Gene, Subgroup, Studies, Sample_size, TT_ids)
-  })
-}
-
-build_asian_study_map <- function(data, genes) {
-  purrr::map_dfr(
-    genes,
-    function(gene) {
-      primary_map <- prepare_gene_data(data, gene = gene, tumor = "primary") %>%
-        summarise(
-          Tumor = "Primary",
-          Studies = n_distinct(TT),
-          Sample_size = sum(n, na.rm = TRUE),
-          TT_ids = paste(sort(unique(TT)), collapse = ", ")
-        )
-
-      metastatic_map <- prepare_gene_data(data, gene = gene, tumor = "metastatic") %>%
-        summarise(
-          Tumor = "Metastatic",
-          Studies = n_distinct(TT),
-          Sample_size = sum(n, na.rm = TRUE),
-          TT_ids = paste(sort(unique(TT)), collapse = ", ")
-        )
-
-      bind_rows(primary_map, metastatic_map) %>%
-        mutate(Gene = gene, .before = 1)
-    }
-  )
 }
 
 write_methodology_map <- function(data, file_path) {
@@ -311,10 +358,9 @@ write_csv(main_data, file.path(results_dir, "tableS11_gene_mutation_clean.csv"),
 write_methodology_map(main_data, file.path(results_dir, "methodology_mapping.csv"))
 
 available_primary_genes <- names(main_data)[18:155]
-available_metastatic_genes <- sub("_metastatic$", "", names(main_data)[162:ncol(main_data)])
 analysis_genes <- key_genes[key_genes %in% available_primary_genes]
 
-# Overall primary models
+# Overall primary models for key genes
 primary_models <- setNames(
   lapply(analysis_genes, function(gene) fit_prevalence_model(prepare_gene_data(main_data, gene, "primary"))),
   analysis_genes
@@ -328,8 +374,8 @@ iwalk(
   }
 )
 
-# Overall metastatic models
-metastatic_analysis_genes <- analysis_genes[analysis_genes %in% available_metastatic_genes]
+# Overall metastatic models for key genes
+metastatic_analysis_genes <- analysis_genes[analysis_genes %in% sub("_metastatic$", "", names(main_data)[162:ncol(main_data)])]
 metastatic_models <- setNames(
   lapply(metastatic_analysis_genes, function(gene) fit_prevalence_model(prepare_gene_data(main_data, gene, "metastatic"))),
   metastatic_analysis_genes
@@ -343,22 +389,9 @@ iwalk(
   }
 )
 
-# Table 2 method-based subgroup analysis
-table2_study_map <- build_method_study_map(main_data, analysis_genes)
-write_csv(table2_study_map, file.path(results_dir, "table2_method_study_map.csv"), na = "")
-
-table2_models <- setNames(
-  lapply(analysis_genes, function(gene) fit_method_subgroup_model(main_data, gene)),
-  analysis_genes
-)
-
-saveRDS(table2_models, file.path(results_dir, "table2_method_models.rds"))
-iwalk(
-  table2_models,
-  function(model, gene) {
-    save_model_summary(model, file.path(results_dir, paste0("table2_method_", gene, "_summary.txt")))
-  }
-)
+# Table 2 method summary
+table2_method_summary <- build_method_summary(main_data, analysis_genes)
+write_csv(table2_method_summary, file.path(results_dir, "table2_method_summary.csv"), na = "")
 
 # Optional Asian pooled prevalence analysis
 if (file.exists(asian_file)) {
@@ -367,15 +400,20 @@ if (file.exists(asian_file)) {
   write_csv(asian_data, file.path(results_dir, "asian_gene_mutation_clean.csv"), na = "")
   write_methodology_map(asian_data, file.path(results_dir, "asian_methodology_mapping.csv"))
 
+  asian_key_summary <- build_asian_summary(asian_data, genes = analysis_genes)
+  asian_all_summary <- build_all_gene_summary(asian_data)
+
+  write_csv(asian_key_summary, file.path(results_dir, "asian_key_genes.csv"), na = "")
+  write_csv(asian_all_summary, file.path(results_dir, "asian_all_genes.csv"), na = "")
+
   asian_primary_models <- setNames(
     lapply(analysis_genes, function(gene) fit_prevalence_model(prepare_gene_data(asian_data, gene, "primary"))),
     analysis_genes
   )
 
-  asian_metastatic_genes <- analysis_genes[analysis_genes %in% sub("_metastatic$", "", names(asian_data)[162:ncol(asian_data)])]
   asian_metastatic_models <- setNames(
-    lapply(asian_metastatic_genes, function(gene) fit_prevalence_model(prepare_gene_data(asian_data, gene, "metastatic"))),
-    asian_metastatic_genes
+    lapply(metastatic_analysis_genes, function(gene) fit_prevalence_model(prepare_gene_data(asian_data, gene, "metastatic"))),
+    metastatic_analysis_genes
   )
 
   saveRDS(
@@ -396,9 +434,6 @@ if (file.exists(asian_file)) {
       save_model_summary(model, file.path(results_dir, paste0("asian_metastatic_", gene, "_summary.txt")))
     }
   )
-
-  asian_study_map <- build_asian_study_map(asian_data, analysis_genes)
-  write_csv(asian_study_map, file.path(results_dir, "asian_study_map.csv"), na = "")
 } else {
   message("Asian Melanoma.xlsx not found. Asia-specific analysis was skipped.")
 }
